@@ -1,0 +1,110 @@
+name: EPG
+on:
+  schedule:
+    - cron: 40 16 * * *
+    - cron: 15 02 * * *
+    - cron: 00 07 * * *
+    - cron: 30 10 * * *
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - url: https://epg.112114.xyz/pp.xml.gz
+            branch: 112114
+            sleep: 0s
+          - url: https://e.erw.cc/e.xml.gz
+            branch: erw
+            sleep: 30s
+
+    steps:
+      - name: 下载文件并校验
+        run: |
+          set +e
+          # 下载历史md5
+          wget -q --no-check-certificate --timeout=10 https://raw.githubusercontent.com/${{ github.repository }}/${{ matrix.branch }}/md5.txt -O md5.txt 2>/dev/null || true
+          # 下载EPG文件
+          wget -q --no-check-certificate --timeout=15 ${{ matrix.url }} -O temp.xml.gz 2>/dev/null
+          # 判断文件是否有效
+          if [ ! -s temp.xml.gz ]; then
+            echo "下载失败，文件为空"
+            rm -f temp.xml.gz md5.txt
+            exit 0
+          fi
+          # 解压（失败自动跳过）
+          gzip -df temp.xml.gz 2>/dev/null
+          if [ ! -s temp.xml ]; then
+            echo "解压失败，文件损坏"
+            rm -f temp.xml.gz temp.xml md5.txt
+            exit 0
+          fi
+
+      - name: MD5对比判断更新
+        run: |
+          md5=$(md5sum temp.xml | awk '{print $1}')
+          echo "md5=$md5" >> $GITHUB_ENV
+          if ! grep -q "$md5" md5.txt 2>/dev/null; then
+            echo "isDiff=true" >> $GITHUB_ENV
+            echo "now_time=$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S')" >> $GITHUB_ENV
+            echo "tag=$(TZ=Asia/Shanghai date '+%Y.%m.%d')" >> $GITHUB_ENV
+          fi
+
+      - name: 拉取仓库代码
+        uses: actions/checkout@v4
+        if: env.isDiff == 'true'
+        with:
+          ref: ${{ matrix.branch }}
+          path: epg
+
+      - name: 安装Python环境
+        uses: actions/setup-python@v5
+        if: env.isDiff == 'true'
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: XML转JSON
+        if: env.isDiff == 'true'
+        working-directory: epg
+        run: |
+          mkdir -p xml json
+          mv ../temp.xml xml/e.xml
+          pip install -r requirements.txt -q
+          python xml2json.py
+
+      - name: 文件整理
+        if: env.isDiff == 'true'
+        working-directory: epg
+        run: |
+          mv xml/e.xml xml/${{ matrix.branch }}.xml
+          mv json/e.json json/${{ matrix.branch }}.json
+          echo ${{ env.md5 }} > md5.txt
+          sleep ${{ matrix.sleep }}
+
+      - name: 发布Release下载
+        uses: ncipollo/release-action@v1
+        if: env.isDiff == 'true'
+        with:
+          tag: ${{ env.tag }}
+          body: |
+            ✅ 更新时间：${{ env.now_time }}
+            📦 数据源：${{ matrix.branch }}
+          allowUpdates: true
+          artifacts: epg/xml/*.xml,epg/json/*.json
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 提交并推送
+        if: env.isDiff == 'true'
+        working-directory: epg
+        run: |
+          git config --local user.name "github-actions[bot]"
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          sed -i "2c * ✅ 更新时间：${{ env.now_time }}" README.md
+          rm -rf xml json
+          git add .
+          git commit -m "${{ env.now_time }} | ${{ matrix.branch }}"
+          git push -f origin ${{ matrix.branch }}
